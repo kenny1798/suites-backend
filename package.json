@@ -1,0 +1,16 @@
+{
+  "name": "suites-backend-monorepo",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:auth": "npm run dev --workspace=auth-service",
+    "dev:salestrack": "npm run dev --workspace=salestrack-service",
+    "jobs:salestrack": "npm run jobs --workspace=salestrack-service",
+    "dev": "concurrently \"npm:dev:auth\" \"npm:dev:salestrack\""
+  },
+  "dependencies": {
+    "crypto": "^1.0.1"
+  }
+}

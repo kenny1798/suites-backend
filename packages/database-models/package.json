@@ -1,0 +1,9 @@
+{
+  "name": "@suites/database-models",
+  "version": "1.0.0",
+  "main": "index.js",
+  "private": true,
+  "scripts": {
+    "sync": "node ../../scripts/sync.js"
+  }
+}
