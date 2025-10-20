@@ -8,3 +8,4 @@ npm-debug.log
 .xlsx
 .pem
 .env
+/certs

@@ -204,8 +204,13 @@ router.post('/verify-session', validateToken, async (req, res) => {
     if (!sessionId) return res.status(400).json({ error: 'SESSION_ID_REQUIRED' });
 
     // expand subscription so we can read its status
-    const session = await stripe.checkout.sessions.retrieve(sessionId, {
-      expand: ['subscription']
+    const session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ['subscription'] });
+
+    console.log('[verify] session:', {
+      status: session.status,
+      payment_status: session.payment_status,
+      sub_status: session.subscription?.status,
+      customer: session.customer,
     });
 
     if (session.status !== 'complete') {
