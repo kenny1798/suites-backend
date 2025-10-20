@@ -1,6 +1,6 @@
 // salestrack-service/controllers/teams.controller.js
 
-const { Teams, TeamMembers, Users, ToolSubscription, Plan, TeamInvitations, sequelize, OpportunityStatuses } = require('@suites/database-models');
+const { Teams, TeamMembers, Users, ToolSubscription, Plan, sequelize, OpportunityStatuses } = require('@suites/database-models');
 
 const CAT_ORDER = ['Prospect', 'Deal', 'Outcome', 'Ongoing'];
 
