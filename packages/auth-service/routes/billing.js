@@ -203,13 +203,14 @@ router.post('/verify-session', validateToken, async (req, res) => {
     const userId = req.user.id;
     if (!sessionId) return res.status(400).json({ error: 'SESSION_ID_REQUIRED' });
 
-    // expand subscription so we can read its status
     const session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ['subscription'] });
+
+    const subStatus = session.subscription?.status; // 'active' | 'trialing' | 'past_due' | 'incomplete' | ...
 
     console.log('[verify] session:', {
       status: session.status,
       payment_status: session.payment_status,
-      sub_status: session.subscription?.status,
+      sub_status: subStatus,
       customer: session.customer,
     });
 
@@ -217,33 +218,31 @@ router.post('/verify-session', validateToken, async (req, res) => {
       return res.status(402).json({ error: 'CHECKOUT_NOT_COMPLETE' });
     }
 
-    const subStatus = session.subscription?.status; // 'trialing' | 'active' | etc.
-    const paidOk =
-      session.payment_status === 'paid' ||
-      (session.payment_status === 'no_payment_required' && (subStatus === 'trialing' || subStatus === 'active'));
-
-    if (!paidOk) {
+    // ✅ Kriteria lulus yang lebih robust:
+    const ok = subStatus === 'active' || subStatus === 'trialing';
+    if (!ok) {
+      // Kalau nak lebih ketat, boleh whitelist juga 'past_due' sementara — tapi biasanya jangan.
       return res.status(402).json({ error: 'PAYMENT_NOT_COMPLETED' });
     }
 
-    // Safety: ensure session belongs to this user
+    // Safety: pastikan session untuk user ni
     const billingInfo = await BillingCustomer.findOne({ where: { userId } });
     if (!billingInfo || session.customer !== billingInfo.stripeCustomerId) {
       return res.status(403).json({ error: 'CUSTOMER_MISMATCH' });
     }
 
-    // TIP: fulfillment is done by webhook; here we just tell UI it's ok
+    // Lulus
     return res.json({
       success: true,
-      message: 'Session verified.',
-      subscriptionStatus: subStatus || null,
+      subscriptionStatus: subStatus,
       paymentStatus: session.payment_status,
     });
-  } catch (error) {
-    console.error('Error verifying session:', error);
+  } catch (e) {
+    console.error('Error verifying session:', e);
     return res.status(500).json({ error: 'Failed to verify session' });
   }
 });
+
 
 
 /**
