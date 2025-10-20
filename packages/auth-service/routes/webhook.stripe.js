@@ -87,6 +87,53 @@ router.post('/stripe', express.raw({ type: 'application/json' }), async (req, re
         break;
       }
 
+      case 'customer.subscription.created': {
+        const s = event.data.object; // subscription
+        // Map status
+        const statusMap = { trialing:'trialing', active:'active', past_due:'past_due', canceled:'canceled' };
+        const status = statusMap[s.status] || 'expired';
+
+        // Dapatkan userId (metadata kalau ada, kalau tak via BillingCustomer)
+        let userId = s?.metadata?.userId ? Number(s.metadata.userId) : null;
+        if (!userId && s.customer) {
+          const row = await BillingCustomer.findOne({ where: { stripeCustomerId: s.customer } });
+          userId = row?.userId || null;
+        }
+        if (!userId) break; // tak boleh resolve user → skip selamat
+
+        // Upsert master subscription
+        await Subscription.upsert({
+          userId,
+          status,
+          provider: 'stripe',
+          providerRef: s.id,
+          currentPeriodEnd: new Date(s.current_period_end * 1000),
+          trialEnd: s.trial_end ? new Date(s.trial_end * 1000) : null,
+        }, { conflictFields: ['provider','providerRef'] });
+
+        // Upsert setiap item → ToolSubscription
+        for (const it of s.items?.data || []) {
+          const priceId = it.price?.id;
+          if (!priceId) continue;
+          const plan = await Plan.findOne({ where: { stripePriceId: priceId } });
+          if (!plan) continue;
+
+          await ToolSubscription.upsert({
+            userId,
+            toolId: plan.toolId || 'unknown',
+            planCode: plan.code,
+            status,
+            trialEnd: s.trial_end ? new Date(s.trial_end * 1000) : null,
+            startedAt: new Date(s.current_period_start * 1000),
+            provider: 'stripe',
+            providerSubRef: s.id,
+            providerItemRef: it.id,
+            currentPeriodEnd: new Date(s.current_period_end * 1000),
+          }, { conflictFields: ['userId','toolId'] });
+        }
+        break;
+      }
+
       case 'customer.subscription.updated':
       case 'customer.subscription.deleted': {
         const s = event.data.object; // subscription
