@@ -5,6 +5,8 @@
     "packages/*"
   ],
   "scripts": {
+    "start:auth": "npm run start --workspace=auth-service",
+    "start:salestrack": "npm run start --workspace=salestrack-service",
     "dev:auth": "npm run dev --workspace=auth-service",
     "dev:salestrack": "npm run dev --workspace=salestrack-service",
     "jobs:salestrack": "npm run jobs --workspace=salestrack-service",
