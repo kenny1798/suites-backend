@@ -9,6 +9,7 @@ const {
     Users,
     sequelize
   } = require('@suites/database-models');
+  const { Op } = require('sequelize');
   
   /**
    * Cipta satu opportunity baru untuk seorang contact.
@@ -78,7 +79,7 @@ const {
   exports.getOpportunities = async (req, res) => {
     try {
       const userId = req.user.id;
-      const { teamId } = req.query;
+      const { teamId, scope = 'active' } = req.query;
   
       if (!teamId) {
         return res.status(400).json({ error: 'teamId query parameter is required.' });
@@ -91,12 +92,17 @@ const {
       }
   
       // Tapis ikut team + owner (userId) SAHAJA — regardless of role
+      const paranoid = String(scope).toLowerCase() !== 'deleted';
+      const where = { teamId, userId };
+      if (!paranoid) where.deletedAt = { [Op.ne]: null }; // hanya yg deleted
+
       const opportunities = await Opportunities.findAll({
-        where: { teamId, userId }, // ⚠️ jika kolum owner lain (contoh: ownerId), tukar ke { teamId, ownerId: userId }
+      where,
+      paranoid, // penting untuk nampak soft-deleted
         include: [
-          { model: Contacts, attributes: ['id', 'name'] },
+          { model: Contacts, attributes: ['id', 'name', 'phone', 'phonecc'] },
           { model: Users, as: 'Owner', attributes: ['id', 'name'] },
-          { model: OpportunityStatuses, attributes: ['id', 'name', 'category'] },
+          { model: OpportunityStatuses, attributes: ['id', 'name', 'category', 'color'] },
         ],
         order: [['createdAt', 'DESC']],
       });
@@ -235,3 +241,181 @@ const {
       return res.status(500).json({ error: 'Failed to assign opportunity.' });
     }
   };
+
+  exports.deleteOpportunity = async (req, res) => {
+    const { id } = req.params;
+    const { teamId } = req.body; // axios DELETE hantar dalam body
+    const userId = req.user.id;
+  
+    if (!teamId) return res.status(400).json({ error: 'teamId is required.' });
+  
+    const t = await sequelize.transaction();
+    try {
+      // mesti ahli team
+      const membership = await TeamMembers.findOne({ where: { userId, teamId }, transaction: t });
+      if (!membership) { await t.rollback(); return res.status(403).json({ error: 'Forbidden' }); }
+  
+      const opp = await Opportunities.findOne({ where: { id, teamId }, transaction: t, lock: t.LOCK.UPDATE });
+      if (!opp) { await t.rollback(); return res.status(404).json({ error: 'Opportunity not found.' }); }
+  
+      // simple ownership guard (boleh longgarkan kalau admin/manager dibenarkan)
+      if (opp.userId !== userId) {
+        // comment line bawah jika admin/manager pun boleh delete
+        await t.rollback();
+        return res.status(403).json({ error: 'Only the owner can delete this opportunity.' });
+      }
+  
+      await opp.destroy({ transaction: t }); // paranoid: true -> soft delete
+  
+      // optional: history log
+      await LeadHistory.create({
+        type: 'OPP_DELETED',
+        opportunityId: opp.id,
+        userId,
+        teamId,
+        details: { name: opp.name },
+      }, { transaction: t });
+  
+      await t.commit();
+      return res.json({ ok: true });
+    } catch (e) {
+      await t.rollback();
+      console.error('[deleteOpportunity]', e);
+      return res.status(500).json({ error: 'Failed to delete opportunity.' });
+    }
+  };
+
+  // controllers/opportunities.controller.js
+exports.deleteTimelineItem = async (req, res) => {
+  const { id: opportunityId, kind } = req.params;
+  const rowId = Number(req.params.rowId);
+  const { teamId } = req.body; // axios.delete(url, { data: { teamId } })
+  const userId = req.user.id;
+
+  if (!teamId) return res.status(400).json({ error: 'teamId is required.' });
+  if (!Number.isFinite(rowId)) return res.status(400).json({ error: 'Invalid timeline item id.' });
+
+  const t = await sequelize.transaction();
+  try {
+    // mesti ahli team
+    const membership = await TeamMembers.findOne({ where: { userId, teamId }, transaction: t });
+    if (!membership) { await t.rollback(); return res.status(403).json({ error: 'Forbidden' }); }
+
+    // pastikan opp memang dalam team
+    const opp = await Opportunities.findOne({ where: { id: opportunityId, teamId }, transaction: t });
+    if (!opp) { await t.rollback(); return res.status(404).json({ error: 'Opportunity not found.' }); }
+
+    // normalize kind
+    const K = String(kind || '').toUpperCase();
+
+    let deleted = 0;
+
+    if (['STATUS_CHANGE', 'OPP_CREATED', 'OWNER_CHANGE', 'VALUE_CHANGE', 'NOTE', 'FOLLOWUP_ATTEMPT'].includes(K)) {
+      const { LeadHistory } = require('@suites/database-models');
+      // ❗ JANGAN tapis teamId di sini sebab st_lead_history tak ada teamId
+      deleted = await LeadHistory.destroy({
+        where: { id: rowId, opportunityId },
+        transaction: t,
+      });
+      if (!deleted) { await t.rollback(); return res.status(404).json({ error: 'Timeline item not found.' }); }
+
+    } else if (K === 'ACTIVITY') {
+      const { Activities } = require('@suites/database-models');
+      // Activities biasanya ada opportunityId; teamId optional — kalau column wujud, boleh kekalkan
+      deleted = await Activities.destroy({
+        where: { id: rowId, opportunityId },
+        transaction: t,
+      });
+      if (!deleted) { await t.rollback(); return res.status(404).json({ error: 'Activity not found.' }); }
+
+    } else if (K === 'TASK') {
+      const { Tasks } = require('@suites/database-models');
+      // Tasks ada teamId; kekalkan tapis teamId untuk keselamatan
+      deleted = await Tasks.destroy({
+        where: { id: rowId, teamId },
+        transaction: t,
+      });
+      if (!deleted) { await t.rollback(); return res.status(404).json({ error: 'Task not found.' }); }
+
+    } else {
+      await t.rollback();
+      return res.status(400).json({ error: `Unsupported kind: ${K}` });
+    }
+
+    await t.commit();
+    return res.json({ ok: true });
+  } catch (e) {
+    await t.rollback();
+    console.error('[deleteTimelineItem]', e);
+    return res.status(500).json({ error: 'Failed to delete timeline item.' });
+  }
+};
+
+// GET /api/salestrack/opportunities/deleted?teamId=...
+exports.getDeletedOpportunities = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { teamId } = req.query;
+    if (!teamId) return res.status(400).json({ error: 'teamId query parameter is required.' });
+
+    const membership = await TeamMembers.findOne({ where: { userId, teamId } });
+    if (!membership) return res.status(403).json({ error: 'Forbidden' });
+
+    const rows = await Opportunities.findAll({
+      where: { teamId, userId, deletedAt: { [Op.ne]: null } },
+      paranoid: false,
+      include: [
+        { model: Contacts, attributes: ['id', 'name', 'phone', 'phonecc'] },
+        { model: Users, as: 'Owner', attributes: ['id', 'name'] },
+        { model: OpportunityStatuses, attributes: ['id', 'name', 'category', 'color'] },
+      ],
+      order: [['deletedAt', 'DESC']],
+    });
+
+    return res.json(rows);
+  } catch (e) {
+    return res.status(500).json({ error: 'Failed to fetch deleted opportunities.', details: e.message });
+  }
+};
+
+// POST /api/salestrack/opportunities/:id/restore
+exports.restoreOpportunity = async (req, res) => {
+  const { id } = req.params;
+  const { teamId } = req.body;
+  const userId = req.user.id;
+
+  if (!teamId) return res.status(400).json({ error: 'teamId is required.' });
+
+  const t = await sequelize.transaction();
+  try {
+    const membership = await TeamMembers.findOne({ where: { userId, teamId }, transaction: t });
+    if (!membership) { await t.rollback(); return res.status(403).json({ error: 'Forbidden' }); }
+
+    const opp = await Opportunities.findOne({
+      where: { id, teamId, userId },
+      paranoid: false,
+      transaction: t,
+      lock: t.LOCK.UPDATE,
+    });
+    if (!opp) { await t.rollback(); return res.status(404).json({ error: 'Opportunity not found.' }); }
+    if (!opp.deletedAt) { await t.rollback(); return res.status(400).json({ error: 'Opportunity is not deleted.' }); }
+
+    await opp.restore({ transaction: t });
+
+    await LeadHistory.create({
+      type: 'OPP_RESTORED',
+      opportunityId: opp.id,
+      userId,
+      details: { name: opp.name },
+    }, { transaction: t });
+
+    await t.commit();
+    return res.json(opp);
+  } catch (e) {
+    await t.rollback();
+    return res.status(500).json({ error: 'Failed to restore opportunity.', details: e.message });
+  }
+};
+
+
+  

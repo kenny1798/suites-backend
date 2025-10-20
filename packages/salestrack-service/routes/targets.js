@@ -5,8 +5,10 @@ const { validateToken } = require('../middlewares/validateToken');
 
 router.use(validateToken);
 
-router.get('/targets', ctrl.listTargets);
-router.put('/targets', ctrl.upsertTarget);
-router.delete('/targets/:id', ctrl.deleteTarget);
+// 1) FE guna endpoint ini sekali je → server pulangkan role + rows yg layak
+router.get('/teams/:teamId/targets/role-view', ctrl.roleView);
+
+// 2) Update target untuk DIRI SENDIRI sahaja
+router.put('/teams/:teamId/targets/me', ctrl.upsertMyTarget);
 
 module.exports = router;

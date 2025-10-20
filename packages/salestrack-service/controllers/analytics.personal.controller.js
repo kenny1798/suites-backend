@@ -5,6 +5,7 @@ const {
   Opportunities,
   OpportunityStatuses,
   LeadHistory,
+  Targets,
 } = require('@suites/database-models');
 
 /* ---------- helpers ---------- */
@@ -39,7 +40,6 @@ function localRangeToUTC(fromStr, toStr, _tzOffsetMinutes = 0) {
     return `${y}-${m}-${d}`;
   }
   
-  // Bina senarai hari [from..to] secara stabil (tanpa terpengaruh timezone host)
   function daysBetween(from, to) {
     const [y1, m1, d1] = from.split('-').map(Number);
     const [y2, m2, d2] = to.split('-').map(Number);
@@ -66,157 +66,244 @@ function localRangeToUTC(fromStr, toStr, _tzOffsetMinutes = 0) {
     };
   };
 
+  function daysInMonth(year, month1to12) {
+    return new Date(year, month1to12, 0).getDate(); // month arg is 1..12
+  }
+  
+  function clampDateStr(a, lo, hi) {
+    return a < lo ? lo : (a > hi ? hi : a);
+  }
+  
+  function enumerateMonthsInRange(from, to) {
+    const [fy, fm] = from.split('-').map(Number);
+    const [ty, tm] = to.split('-').map(Number);
+    const out = [];
+    let y = fy, m = fm;
+    while (y < ty || (y === ty && m <= tm)) {
+      out.push({ year: y, month: m });
+      m += 1;
+      if (m > 12) { m = 1; y += 1; }
+    }
+    return out;
+  }
+  
+  async function fetchTargetsForRange(teamId, userId, from, to) {
+    const months = enumerateMonthsInRange(from, to);
+    if (months.length === 0) return [];
+  
+    // Query by OR of (year, month) pairs
+    const whereOr = months.map(({year, month}) => ({ year, month }));
+    return Targets.findAll({
+      where: { teamId, userId, [Op.or]: whereOr },
+      attributes: ['year','month','targetValue','targetUnits'],
+      raw: true,
+    });
+  }
+  
+  function computeTargetCentsForRange(from, to, targetRows) {
+    let total = 0;
+  
+    for (const row of targetRows) {
+      const { year, month, targetValue = 0 } = row; // cents
+      const dim = daysInMonth(year, month);
+  
+      const monthStr = String(month).padStart(2, '0');
+      const monthStart = `${year}-${monthStr}-01`;
+      const monthEnd = `${year}-${monthStr}-${String(dim).padStart(2,'0')}`;
+  
+      const start = clampDateStr(monthStart, from, to);
+      const end   = clampDateStr(monthEnd,   from, to);
+  
+      if (start > end) continue; // no overlap
+  
+      const overlapDays = daysBetween(start, end).length; // inclusive
+      const portion = overlapDays / dim;
+  
+      // Round to nearest cent for stability
+      total += Math.round(targetValue * portion);
+    }
+    return total;
+  }
+  
+  function buildDailyTargetMap(from, to, targetRows) {
+    const byMonth = new Map(); // 'yyyy-mm' -> { dailyCents }
+    for (const r of targetRows) {
+      const m = String(r.month).padStart(2,'0');
+      const key = `${r.year}-${m}`;
+      const dim = daysInMonth(r.year, r.month);
+      const daily = dim > 0 ? (r.targetValue || 0) / dim : 0; // float cents/day
+      byMonth.set(key, daily);
+    }
+  
+    const perDay = new Map(); // 'yyyy-mm-dd' -> integer cents (rounded)
+    for (const d of daysBetween(from, to)) {
+      const ym = d.slice(0,7); // 'yyyy-mm'
+      const daily = byMonth.get(ym) || 0;
+      perDay.set(d, Math.round(daily));
+    }
+    return perDay;
+  }
+  
+
 
 /* ---------- CONTROLLER: Personal Summary ---------- */
 exports.personalSummary = async (req, res) => {
-    try {
-      const teamId   = Number(req.query.teamId);
-      const userId   = Number(req.query.userId);
-      const from     = String(req.query.from || '');
-      const to       = String(req.query.to   || '');
-      const tzOffset = Number(req.query.tzOffset ?? 0);
-  
-      if (!teamId || !userId || !from || !to) {
-        return res.status(400).json({ error: 'teamId, userId, from, to are required.' });
-      }
-
-  
-      // authorize
-      const member = await TeamMembers.findOne({ where: { teamId, userId } });
-      if (!member) return res.status(403).json({ error: 'Forbidden' });
-  
-      const { startUTC, endUTC } = localRangeToUTC(from, to, tzOffset);
-  
-      // KPI: contacts & opps created
-      const [newContacts, oppCreated] = await Promise.all([
-        Contacts.count({ where: { teamId, userId, createdAt: { [Op.between]: [startUTC, endUTC] } } }),
-        Opportunities.count({ where: { teamId, userId, createdAt: { [Op.between]: [startUTC, endUTC] } } }),
-      ]);
-  
-      // KPI: won deals & value (STRICT isWon)
-        const wonIds = (await OpportunityStatuses.findAll({
-            where: { teamId, isWon: true }, attributes: ['id'],
-        })).map(s => s.id);
-        
-        const wonHist = await LeadHistory.findAll({
-            attributes: ['id', 'details', 'createdAt'],
-            where: { type: 'STATUS_CHANGE', createdAt: { [Op.between]: [startUTC, endUTC] } },
-            include: [{ model: Opportunities, attributes: ['id','value','userId','teamId'], where: { teamId, userId }, required: true }],
-            raw: true,
-        });
-
-        
-        let wonDeals = 0;
-        let actualCents = 0;
-        for (const h of wonHist) {
-            const det = h.details || {};
-            const toId = det.toStatusId ?? det.to?.id;
-            if (!wonIds.includes(Number(toId))) continue;
-            wonDeals += 1;
-            actualCents += Number(h['Opportunity.value'] || 0);
-        }
-  
-  
-      res.json({
-        range: { from, to, tzOffset },
-        kpis: { targetCents: 0, actualCents, wonDeals, newContacts, oppCreated },
-      });
-    } catch (e) {
-      console.error(e);
-      res.status(500).json({ error: 'Failed to compute personal summary.', details: e.message });
-    }
-  };
-
-exports.personalSheet = async (req, res) => {
+  try {
     const teamId   = Number(req.query.teamId);
     const userId   = Number(req.query.userId);
-    const from     = String(req.query.from || '').slice(0,10);
-    const to       = String(req.query.to   || '').slice(0,10);
+    const from     = String(req.query.from || '');
+    const to       = String(req.query.to   || '');
     const tzOffset = Number(req.query.tzOffset ?? 0);
 
-  
     if (!teamId || !userId || !from || !to) {
       return res.status(400).json({ error: 'teamId, userId, from, to are required.' });
     }
-  
-    try {
-      const member = await TeamMembers.findOne({ where: { teamId, userId } });
-      if (!member) return res.status(403).json({ error: 'Forbidden' });
-  
-      const { startUTC, endUTC } = localRangeToUTC(from, to);
-      const days = daysBetween(from, to);
-  
-      // 1) Dapatkan senarai status Won
-      const wonIds = (await OpportunityStatuses.findAll({
-        where: { teamId, isWon: true }, attributes: ['id'],
-      })).map(s => s.id);
-  
-      // 2) Ambil rekod LEAD HISTORY ketika bertukar → Won dalam window
-      //    Kita join ke Opportunities utk pastikan owner (=userId) & teamId.
-      const wonHist = wonIds.length ? await LeadHistory.findAll({
-        attributes: ['id', 'details', 'createdAt'],
-        where: {
-          type: 'STATUS_CHANGE',
-          createdAt: { [Op.between]: [startUTC, endUTC] },
-        },
-        include: [{
-          model: Opportunities,
-          attributes: ['id', 'value', 'userId', 'teamId'],
-          where: { teamId, userId },
-          required: true,
-        }],
-        raw: true,
-      }) : [];
 
-  
-      // 3) Bucket nilai ikut hari LOCAL, tetapi hanya jika toStatusId ∈ wonIds
-      const wonMap = new Map(); // day -> cents
-      for (const h of wonHist) {
-        const det = h.details || {};
-        const toId = det.toStatusId ?? det.to?.id;
-        if (!wonIds.includes(Number(toId))) continue;
-        const day = localDay(h.createdAt, tzOffset);
-        const cents = Number(h['Opportunity.value'] || 0);
-        wonMap.set(day, (wonMap.get(day) || 0) + cents);
-      }
+    // authorize
+    const member = await TeamMembers.findOne({ where: { teamId, userId } });
+    if (!member) return res.status(403).json({ error: 'Forbidden' });
 
-  
-      // 4) New Contacts + Opp Created (kekal macam sebelum ni)
-      const contactRows = await Contacts.findAll({
-        where: { teamId, userId, createdAt: { [Op.between]: [startUTC, endUTC] } },
-        attributes: ['id','createdAt'],
-      });
-      const oppRows = await Opportunities.findAll({
-        where: { teamId, userId, createdAt: { [Op.between]: [startUTC, endUTC] } },
-        attributes: ['id','createdAt'],
-      });
-  
-      const contactMap = new Map();
-      for (const c of contactRows) {
-        const day = localDay(c.createdAt, tzOffset);
-        contactMap.set(day, (contactMap.get(day) || 0) + 1);
-      }
-      const oppMap = new Map();
-      for (const o of oppRows) {
-        const day = localDay(o.createdAt, tzOffset);
-        oppMap.set(day, (oppMap.get(day) || 0) + 1);
-      }
-  
-      // 5) Sheet
-      const sheet = days.map(d => ({
-        date: d,
-        targetCents: 0,
-        actualCents: wonMap.get(d) || 0,
-        newContacts: contactMap.get(d) || 0,
-        oppCreated:  oppMap.get(d) || 0,
-      }));
-  
-      res.json({ range: { from, to, tzOffset }, sheet });
-    } catch (e) {
-      console.error(e);
-      res.status(500).json({ error: 'Failed to compute daily sheet.', details: e.message });
+    const { startUTC, endUTC } = localRangeToUTC(from, to, tzOffset);
+
+    // ---------- NEW: fetch/prorate targets in range ----------
+    const targetRows = await fetchTargetsForRange(teamId, userId, from, to);
+    const targetCents = computeTargetCentsForRange(from, to, targetRows);
+    // ----------------------------------------------------------
+
+    // KPI: contacts & opps created
+    const [newContacts, oppCreated] = await Promise.all([
+      Contacts.count({ where: { teamId, userId, createdAt: { [Op.between]: [startUTC, endUTC] } } }),
+      Opportunities.count({ where: { teamId, userId, createdAt: { [Op.between]: [startUTC, endUTC] } } }),
+    ]);
+
+    // KPI: won deals & value (STRICT isWon)
+    const wonIds = (await OpportunityStatuses.findAll({
+      where: { teamId, isWon: true }, attributes: ['id'],
+    })).map(s => s.id);
+
+    const wonHist = await LeadHistory.findAll({
+      attributes: ['id', 'details', 'createdAt'],
+      where: { type: 'STATUS_CHANGE', createdAt: { [Op.between]: [startUTC, endUTC] } },
+      include: [{ model: Opportunities, attributes: ['id','value','userId','teamId'], where: { teamId, userId }, required: true }],
+      raw: true,
+    });
+
+    let wonDeals = 0;
+    let actualCents = 0;
+    for (const h of wonHist) {
+      const det = h.details || {};
+      const toId = det.toStatusId ?? det.to?.id;
+      if (!wonIds.includes(Number(toId))) continue;
+      wonDeals += 1;
+      actualCents += Number(h['Opportunity.value'] || 0);
     }
-  };
+
+    res.json({
+      range: { from, to, tzOffset },
+      kpis: {
+        targetCents,               // <— now computed
+        actualCents,
+        wonDeals,
+        newContacts,
+        oppCreated
+      },
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Failed to compute personal summary.', details: e.message });
+  }
+};
+
+exports.personalSheet = async (req, res) => {
+  const teamId   = Number(req.query.teamId);
+  const userId   = Number(req.query.userId);
+  const from     = String(req.query.from || '').slice(0,10);
+  const to       = String(req.query.to   || '').slice(0,10);
+  const tzOffset = Number(req.query.tzOffset ?? 0);
+
+  if (!teamId || !userId || !from || !to) {
+    return res.status(400).json({ error: 'teamId, userId, from, to are required.' });
+  }
+
+  try {
+    const member = await TeamMembers.findOne({ where: { teamId, userId } });
+    if (!member) return res.status(403).json({ error: 'Forbidden' });
+
+    const { startUTC, endUTC } = localRangeToUTC(from, to);
+    const days = daysBetween(from, to);
+
+    // ---------- NEW: build daily target map ----------
+    const targetRows = await fetchTargetsForRange(teamId, userId, from, to);
+    const dailyTargetMap = buildDailyTargetMap(from, to, targetRows); // date -> cents
+    // -------------------------------------------------
+
+    // 1) won status ids
+    const wonIds = (await OpportunityStatuses.findAll({
+      where: { teamId, isWon: true }, attributes: ['id'],
+    })).map(s => s.id);
+
+    // 2) won transitions history (scoped to user)
+    const wonHist = wonIds.length ? await LeadHistory.findAll({
+      attributes: ['id', 'details', 'createdAt'],
+      where: {
+        type: 'STATUS_CHANGE',
+        createdAt: { [Op.between]: [startUTC, endUTC] },
+      },
+      include: [{
+        model: Opportunities,
+        attributes: ['id', 'value', 'userId', 'teamId'],
+        where: { teamId, userId },
+        required: true,
+      }],
+      raw: true,
+    }) : [];
+
+    const wonMap = new Map(); // day -> cents
+    for (const h of wonHist) {
+      const det = h.details || {};
+      const toId = det.toStatusId ?? det.to?.id;
+      if (!wonIds.includes(Number(toId))) continue;
+      const day = localDay(h.createdAt, tzOffset);
+      const cents = Number(h['Opportunity.value'] || 0);
+      wonMap.set(day, (wonMap.get(day) || 0) + cents);
+    }
+
+    // 4) New Contacts + Opp Created
+    const contactRows = await Contacts.findAll({
+      where: { teamId, userId, createdAt: { [Op.between]: [startUTC, endUTC] } },
+      attributes: ['id','createdAt'],
+    });
+    const oppRows = await Opportunities.findAll({
+      where: { teamId, userId, createdAt: { [Op.between]: [startUTC, endUTC] } },
+      attributes: ['id','createdAt'],
+    });
+
+    const contactMap = new Map();
+    for (const c of contactRows) {
+      const day = localDay(c.createdAt, tzOffset);
+      contactMap.set(day, (contactMap.get(day) || 0) + 1);
+    }
+    const oppMap = new Map();
+    for (const o of oppRows) {
+      const day = localDay(o.createdAt, tzOffset);
+      oppMap.set(day, (oppMap.get(day) || 0) + 1);
+    }
+
+    // 5) Sheet (now with targetCents per day)
+    const sheet = days.map(d => ({
+      date: d,
+      targetCents: dailyTargetMap.get(d) || 0,   // <— filled
+      actualCents: wonMap.get(d) || 0,
+      newContacts: contactMap.get(d) || 0,
+      oppCreated:  oppMap.get(d) || 0,
+    }));
+
+    res.json({ range: { from, to, tzOffset }, sheet });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Failed to compute daily sheet.', details: e.message });
+  }
+};
 
 exports.personalConversions = async (req, res) => {
     try {

@@ -8,6 +8,7 @@ const {
   OpportunityStatuses,
   LeadHistory,
   Users,
+  Targets,
 } = require('@suites/database-models');
 
 /* ---------- helpers ---------- */
@@ -69,6 +70,89 @@ async function ensureManagerHasRep(teamId, managerUserId, repUserId){
     if (!link) return { ok:false, err:'Forbidden' };
     return { ok:true };
   }
+
+// ===== Target helpers (monthly -> prorated / daily) =====
+function daysInMonth(year, month1to12) {
+  return new Date(year, month1to12, 0).getDate();
+}
+function clampDateStr(a, lo, hi) {
+  return a < lo ? lo : (a > hi ? hi : a);
+}
+function enumerateMonthsInRange(from, to) {
+  const [fy, fm] = from.split('-').map(Number);
+  const [ty, tm] = to.split('-').map(Number);
+  const out = [];
+  let y = fy, m = fm;
+  while (y < ty || (y === ty && m <= tm)) {
+    out.push({ year: y, month: m });
+    m += 1; if (m > 12) { m = 1; y += 1; }
+  }
+  return out;
+}
+
+async function fetchTargetsForRangeMulti(teamId, userIds, from, to) {
+  if (!userIds?.length) return [];
+  const months = enumerateMonthsInRange(from, to);
+  if (months.length === 0) return [];
+  const whereOr = months.map(({year, month}) => ({ year, month }));
+  return Targets.findAll({
+    where: {
+      teamId,
+      userId: { [Op.in]: userIds },
+      [Op.or]: whereOr,
+    },
+    attributes: ['userId','year','month','targetValue','targetUnits'],
+    raw: true,
+  });
+}
+
+function computeTargetCentsForRangeMulti(from, to, targetRows) {
+  let total = 0;
+  for (const r of targetRows) {
+    const { year, month, targetValue = 0 } = r;
+    const dim = daysInMonth(year, month);
+    const ms = String(month).padStart(2,'0');
+    const monthStart = `${year}-${ms}-01`;
+    const monthEnd   = `${year}-${ms}-${String(dim).padStart(2,'0')}`;
+    const start = clampDateStr(monthStart, from, to);
+    const end   = clampDateStr(monthEnd,   from, to);
+    if (start > end) continue;
+    const overlapDays = daysBetween(start, end).length; // inclusive
+    total += Math.round(Number(targetValue) * (overlapDays / dim));
+  }
+  return total;
+}
+
+function buildDailyTargetMapMulti(from, to, targetRows) {
+  // key 'yyyy-mm' -> jumlah daily cents (sum semua user)
+  const monthDaily = new Map();
+  for (const r of targetRows) {
+    const { year, month, targetValue = 0 } = r;
+    const dim = daysInMonth(year, month);
+    const ym  = `${year}-${String(month).padStart(2,'0')}`;
+    const daily = dim ? Number(targetValue) / dim : 0; // float cents/day
+    monthDaily.set(ym, (monthDaily.get(ym) || 0) + daily);
+  }
+  // date -> rounded cents
+  const perDay = new Map();
+  for (const d of daysBetween(from, to)) {
+    const ym = d.slice(0,7);
+    const dailySum = monthDaily.get(ym) || 0;
+    perDay.set(d, Math.round(dailySum));
+  }
+  return perDay;
+}
+
+async function fetchTargetsForRange(teamId, userId, from, to) {
+  return fetchTargetsForRangeMulti(teamId, [userId], from, to);
+}
+function computeTargetCentsForRange(from, to, rows) {
+  return computeTargetCentsForRangeMulti(from, to, rows);
+}
+function buildDailyTargetMap(from, to, rows) {
+  return buildDailyTargetMapMulti(from, to, rows);
+}
+
 
 /* ---------- list reps bawah manager ---------- */
 exports.listMyReps = async (req, res) => {
@@ -150,6 +234,9 @@ exports.managerSummary = async (req, res) => {
 
     const { startUTC, endUTC } = toUTCWindow(from, to);
 
+    const targetRows = await fetchTargetsForRangeMulti(teamId, scopeUserIds, from, to);
+    const targetCents = computeTargetCentsForRangeMulti(from, to, targetRows);
+
     // 4) Kira KPI
     const [newContacts, oppCreated] = await Promise.all([
       Contacts.count({
@@ -177,8 +264,7 @@ exports.managerSummary = async (req, res) => {
     const wonDeals    = wonRows.length;
     const actualCents = wonRows.reduce((s, r) => s + Number(r.value || 0), 0);
 
-    // (Jika ada target per user/period boleh jumlahkan di sini; buat 0 dahulu)
-    const targetCents = 0;
+
 
     res.json({
       range: { from, to, tzOffset },
@@ -262,6 +348,9 @@ exports.managerSheet = async (req, res) => {
         },
         attributes: ['id', 'createdAt'],
       });
+
+      const targetRows = await fetchTargetsForRangeMulti(teamId, userIds, from, to);
+      const dailyTargetMap = buildDailyTargetMapMulti(from, to, targetRows);
   
       // 4) Bucket by LOCAL day (ikut tzOffset)
       const wonMap = new Map();  // day -> cents
@@ -286,7 +375,7 @@ exports.managerSheet = async (req, res) => {
       // 5) Bina sheet (ikut urutan tarikh)
       const sheet = days.map(d => ({
         date: d,
-        targetCents: 0,                        // kalau ada target harian per-user, jumlahkan di sini
+        targetCents: dailyTargetMap.get(d) || 0,
         actualCents: wonMap.get(d) || 0,
         newContacts: cMap.get(d) || 0,
         oppCreated:  oMap.get(d) || 0,
@@ -316,6 +405,9 @@ exports.managerRepSummary = async (req, res) => {
       if (!auth.ok) return res.status(403).json({ error: auth.err });
   
       const { startUTC, endUTC } = toUTCWindow(from, to);
+
+    const targetRows = await fetchTargetsForRange(teamId, repUserId, from, to);
+    const targetCents = computeTargetCentsForRange(from, to, targetRows);
   
       const [newContacts, oppCreated] = await Promise.all([
         Contacts.count({ where: { teamId, userId: repUserId, createdAt:{ [Op.between]:[startUTC,endUTC] } } }),
@@ -340,7 +432,7 @@ exports.managerRepSummary = async (req, res) => {
       res.json({
         range: { from, to, tzOffset },
         rep: { userId: repUserId },
-        kpis: { targetCents:0, actualCents, wonDeals, newContacts, oppCreated },
+        kpis: { targetCents, actualCents, wonDeals, newContacts, oppCreated },
       });
     } catch (e) {
       console.error(e);
@@ -372,6 +464,9 @@ exports.managerRepSheet = async (req, res) => {
       for (let d=new Date(s); d<=e; d.setDate(d.getDate()+1)) days.push(asDate(d));
     }
     const localDay = (utc, off) => asDate(new Date(new Date(utc).getTime()+off*60*1000));
+
+    const targetRows = await fetchTargetsForRange(teamId, repUserId, from, to);
+    const dailyTargetMap = buildDailyTargetMap(from, to, targetRows);
 
     // Won rows
     const wonRows = await Opportunities.findAll({
@@ -413,7 +508,7 @@ exports.managerRepSheet = async (req, res) => {
 
     const sheet = days.map(d => ({
       date: d,
-      targetCents: 0,
+      targetCents: dailyTargetMap.get(d) || 0,
       actualCents: wonMap.get(d)||0,
       newContacts: cMap.get(d)||0,
       oppCreated:  oMap.get(d)||0,

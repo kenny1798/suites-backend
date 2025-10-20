@@ -2,7 +2,7 @@
 module.exports = (sequelize, DataTypes) => {
   const LeadHistory = sequelize.define('LeadHistory', {
     id: { type: DataTypes.INTEGER, autoIncrement: true, primaryKey: true },
-    type: { type: DataTypes.ENUM('OPP_CREATED', 'STATUS_CHANGE', 'OWNER_CHANGE', 'VALUE_CHANGE', 'NOTE'), allowNull: false },
+    type: { type: DataTypes.STRING(32), allowNull: false },
     details: { type: DataTypes.JSON },
 
     // <<< PENAMBAHBAIKAN DI SINI

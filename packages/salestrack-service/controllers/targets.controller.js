@@ -1,259 +1,158 @@
-// salestrack-service/controllers/targets.controller.js
+// salestrack-service/controllers/targets.roleview.controller.js
 const { Op } = require('sequelize');
 const {
-  TeamMembers,
-  TeamReporting,
-  Users,
-  Targets,
-  Teams, // optional if you store ownerId here
+  TeamMembers, TeamReporting, Targets, Users,
 } = require('@suites/database-models');
 
-/* ---------- helpers ---------- */
-async function isTeamMember(teamId, userId) {
-  const tm = await TeamMembers.findOne({ where: { teamId, userId } });
-  return tm || null;
-}
-async function repIdsUnderManager(teamId, managerUserId) {
-  const links = await TeamReporting.findAll({
-    where: { teamId, managerUserId },
-    attributes: ['repUserId'],
-  });
-  return links.map(r => r.repUserId);
-}
+/** helper */
+const pickMY = (req) => ({
+  teamId: Number(req.params.teamId),
+  month:  Number(req.query.month),
+  year:   Number(req.query.year),
+  q:      (req.query.q || '').trim(),
+});
 
-/** Try to infer role flags from TeamMembers + TeamReporting (+ Teams.ownerId if exists) */
-async function getRoleFlags(teamId, userId) {
-  const tm = await isTeamMember(teamId, userId);
-  if (!tm) return { isMember:false, isOwnerAdmin:false, isManager:false };
-
-  let isOwnerAdmin = false;
-  // tolerate different schemas:
-  if (tm.role && ['OWNER','ADMIN'].includes(String(tm.role).toUpperCase())) isOwnerAdmin = true;
-  if (tm.isOwner || tm.isAdmin) isOwnerAdmin = true;
-
-  try {
-    const team = await Teams.findByPk(tm.teamId, { attributes: ['ownerId'] });
-    if (team && Number(team.ownerId) === Number(userId)) isOwnerAdmin = true;
-  } catch (_) {}
-
-  const repLinks = await TeamReporting.count({ where: { teamId, managerUserId: userId } });
-  const isManager = repLinks > 0;
-
-  return { isMember:true, isOwnerAdmin, isManager };
+function asDTO(row) {
+  return {
+    id: row.id,
+    userId: row.userId,
+    month: row.month,
+    year: row.year,
+    targetValue: Number(row.targetValue || 0),
+    targetUnits: Number(row.targetUnits || 0),
+    user: row.User ? { id: row.User.id, name: row.User.name, email: row.User.email } : null,
+  };
 }
 
-/** Build candidate userIds by scope & role */
-async function resolveScopeUserIds({
-  teamId,
-  requesterId,
-  scope,               // 'self' | 'manager' | 'team' | 'managerOnly' | 'rep'
-  managerUserId,       // for owner/admin selecting a manager
-  repUserId,           // for owner/admin selecting a single rep
-  includeManager = false, // when scope=manager and owner wants include manager in list
-}) {
-  const { isOwnerAdmin, isManager } = await getRoleFlags(teamId, requesterId);
-
-  // Sales Rep: force self
-  if (!isOwnerAdmin && !isManager) {
-    return [requesterId];
-  }
-
-  // Manager: allow self OR their reps
-  if (isManager && !isOwnerAdmin) {
-    if (scope === 'manager') {
-      return await repIdsUnderManager(teamId, requesterId);            // reps only
-    }
-    if (scope === 'rep' && repUserId) {
-      const ids = await repIdsUnderManager(teamId, requesterId);
-      if (!ids.includes(Number(repUserId))) return [];                 // forbidden
-      return [Number(repUserId)];
-    }
-    // default: self
-    return [requesterId];
-  }
-
-  // Owner/Admin:
-  if (isOwnerAdmin) {
-    if (scope === 'rep' && repUserId) return [Number(repUserId)];
-    if (scope === 'manager' && managerUserId) {
-      const reps = await repIdsUnderManager(teamId, Number(managerUserId));
-      return includeManager ? [...reps, Number(managerUserId)] : reps;
-    }
-    if (scope === 'managerOnly' && managerUserId) {
-      return await repIdsUnderManager(teamId, Number(managerUserId));  // explicitly exclude manager
-    }
-    // Whole team
-    const tms = await TeamMembers.findAll({ where: { teamId }, attributes: ['userId'] });
-    return tms.map(x => x.userId);
-  }
-
-  // fallback
-  return [requesterId];
-}
-
-/* ---------- LIST (searchable) ---------- */
 /**
- * GET /api/salestrack/targets
- * Query:
- *  - teamId, month, year (required)
- *  - scope: 'self' | 'manager' | 'team' | 'managerOnly' | 'rep'  (optional)
- *  - managerUserId (when scope=manager/managerOnly for owner/admin)
- *  - repUserId (when scope=rep for owner/admin OR manager)
- *  - q (optional, search name/email)
+ * GET /teams/:teamId/targets/role-view?month&year&q
+ * Pulangkan:
+ * { role, me:{id,name,email}, sections:[ {key,title,rows:[{... , canEdit:true|false}]} ] }
  */
-exports.listTargets = async (req, res) => {
-  try {
-    const teamId = Number(req.query.teamId);
-    const month  = Number(req.query.month);
-    const year   = Number(req.query.year);
-    const scope  = String(req.query.scope || 'self');
-    const managerUserId = req.query.managerUserId ? Number(req.query.managerUserId) : null;
-    const repUserId     = req.query.repUserId ? Number(req.query.repUserId) : null;
-    const includeManager = String(req.query.includeManager || '') === '1';
-    const q = (req.query.q || '').trim();
+exports.roleView = async (req, res) => {
+  const me = req.user;
+  const { teamId, month, year, q } = pickMY(req);
+  if (!teamId || !month || !year) return res.status(400).json({ error: 'teamId, month, year are required.' });
 
-    const requesterId = req.user.id;
+  // 1) sahkan ahli & role
+  const membership = await TeamMembers.findOne({ where: { teamId, userId: me.id } });
+  if (!membership) return res.status(403).json({ error: 'Forbidden' });
+  const role = membership.role; // OWNER | ADMIN | MANAGER | SALES_REP
 
-    if (!teamId || !month || !year) {
-      return res.status(400).json({ error: 'teamId, month, year are required.' });
-    }
-    const tm = await isTeamMember(teamId, requesterId);
-    if (!tm) return res.status(403).json({ error: 'Forbidden' });
+  // 2) build scope by role
+  let sections = [];
 
-    // resolve visible user ids by role + scope
-    let userIds = await resolveScopeUserIds({
-      teamId, requesterId, scope, managerUserId, repUserId, includeManager
+  // SALES_REP — hanya diri sendiri (boleh edit)
+  if (role === 'SALES_REP') {
+    const row = await Targets.findOne({
+      where: { teamId, userId: me.id, month, year },
+      include: [{ model: Users, attributes: ['id','name','email'] }],
     });
-    if (!userIds || userIds.length === 0) {
-      return res.json({ month, year, items: [] });
-    }
-
-    // apply name/email search
-    const whereUser = { id: { [Op.in]: userIds } };
-    if (q) {
-      whereUser[Op.or] = [
-        { name:  { [Op.like]: `%${q}%` } },
-        { email: { [Op.like]: `%${q}%` } },
-      ];
-    }
-
-    const users = await Users.findAll({
-      where: whereUser,
-      attributes: ['id', 'name', 'email'],
-      order: [['name', 'ASC']],
+    sections.push({
+      key: 'self',
+      title: 'My Target',
+      rows: [asDTO(row || { teamId, userId: me.id, month, year, targetValue:0, targetUnits:0, User: me })]
+        .map(r => ({ ...r, canEdit: true })),
     });
+  }
 
+  // MANAGER — self (editable) + reps bawah dia (read-only)
+  if (role === 'MANAGER') {
+    // self
+    const self = await Targets.findOne({
+      where: { teamId, userId: me.id, month, year },
+      include: [{ model: Users, attributes: ['id','name','email'] }],
+    });
+    const selfRows = [asDTO(self || { teamId, userId: me.id, month, year, targetValue:0, targetUnits:0, User: me })]
+      .map(r => ({ ...r, canEdit: true }));
+
+    // reps bawah dia
+    const links = await TeamReporting.findAll({ where: { teamId, managerUserId: me.id }, attributes:['repUserId'] });
+    const repIds = links.map(x => x.repUserId);
+    let repUsers = [];
+    if (repIds.length) {
+      repUsers = await Users.findAll({ where: { id: { [Op.in]: repIds }}, attributes: ['id','name','email'] });
+    }
+    // Cari targets utk semua rep
+    const repTargets = await Targets.findAll({
+      where: { teamId, userId: { [Op.in]: repIds }, month, year },
+      include: [{ model: Users, attributes: ['id','name','email'] }],
+    });
+    // Pastikan semua rep appear walau tiada row target
+    const repRows = repUsers.map(u => {
+      const match = repTargets.find(t => t.userId === u.id);
+      return asDTO(match || { teamId, userId: u.id, month, year, targetValue:0, targetUnits:0, User: u });
+    }).map(r => ({ ...r, canEdit: false }));
+
+    // search q apply pada kedua-dua set
+    const matchQ = (row) => {
+      if (!q) return true;
+      const blob = `${row.user?.name||''} ${row.user?.email||''}`.toLowerCase();
+      return blob.includes(q.toLowerCase());
+    };
+
+    sections.push({ key:'self', title:'My Target', rows: selfRows.filter(matchQ) });
+    sections.push({ key:'team', title:'My Reps (read-only)', rows: repRows.filter(matchQ) });
+  }
+
+  // OWNER/ADMIN — semua ahli team (kecuali diri sendiri), read-only
+  if (role === 'OWNER' || role === 'ADMIN') {
+    // ambil semua users dalam team (dari TeamMembers) kecuali diri sendiri
+    const memberRows = await TeamMembers.findAll({
+      where: { teamId, userId: { [Op.ne]: me.id } },
+      include: [{ model: Users, attributes: ['id','name','email'] }],
+      attributes: ['userId'],
+    });
+    const userIds = memberRows.map(m => m.userId);
     const targets = await Targets.findAll({
-      where: { teamId, month, year, userId: { [Op.in]: users.map(u=>u.id) } },
-      attributes: ['id','userId','targetValue','targetUnits'],
+      where: { teamId, userId: { [Op.in]: userIds }, month, year },
+      include: [{ model: Users, attributes: ['id','name','email'] }],
     });
 
-    const byUser = new Map();
-    for (const t of targets) byUser.set(t.userId, t);
+    const allRows = memberRows.map(m => {
+      const u = m.User;
+      const t = targets.find(x => x.userId === m.userId);
+      return asDTO(t || { teamId, userId: m.userId, month, year, targetValue:0, targetUnits:0, User: u });
+    }).map(r => ({ ...r, canEdit: false }));
 
-    const items = users.map(u => {
-      const t = byUser.get(u.id);
-      return {
-        userId: u.id,
-        name: u.name || `User #${u.id}`,
-        email: u.email || null,
-        targetId: t?.id || null,
-        targetValue: t?.targetValue || 0,
-        targetUnits: t?.targetUnits || 0,
-      };
+    const list = !q ? allRows : allRows.filter(r => {
+      const s = `${r.user?.name||''} ${r.user?.email||''}`.toLowerCase();
+      return s.includes(q.toLowerCase());
     });
 
-    res.json({ month, year, items });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'Failed to list targets.', details: e.message });
+    sections.push({ key:'team', title:'Team Targets (read-only)', rows: list });
   }
+
+  res.json({
+    role,
+    me: { id: me.id, name: me.name, email: me.email },
+    sections,
+  });
 };
 
-/* ---------- UPSERT (permissioned) ---------- */
 /**
- * PUT /api/salestrack/targets
- * Body: { teamId, userId, month, year, targetValue, targetUnits }
- * Permission:
- *  - Sales Rep: only self
- *  - Manager: self + reps under them
- *  - Owner/Admin: anyone in team
+ * PUT /teams/:teamId/targets/me
+ * Sales Rep & Manager: boleh edit diri sendiri.
+ * Owner/Admin: DILARANG.
  */
-exports.upsertTarget = async (req, res) => {
-  try {
-    const { teamId, userId, month, year, targetValue = 0, targetUnits = 0 } = req.body || {};
-    const requesterId = req.user.id;
+exports.upsertMyTarget = async (req, res) => {
+  const me = req.user;
+  const teamId = Number(req.params.teamId);
+  const { month, year, targetValue = 0, targetUnits = 0 } = req.body || {};
+  if (!teamId || !month || !year) return res.status(400).json({ error: 'teamId, month, year are required.' });
 
-    if (!teamId || !userId || !month || !year) {
-      return res.status(400).json({ error: 'teamId, userId, month, year are required.' });
-    }
-    const tm = await isTeamMember(teamId, requesterId);
-    if (!tm) return res.status(403).json({ error: 'Forbidden' });
+  const membership = await TeamMembers.findOne({ where: { teamId, userId: me.id } });
+  if (!membership) return res.status(403).json({ error: 'Forbidden' });
 
-    const { isOwnerAdmin, isManager } = await getRoleFlags(teamId, requesterId);
-
-    let allowed = false;
-    if (isOwnerAdmin) {
-      allowed = true;
-    } else if (isManager) {
-      const reps = await repIdsUnderManager(teamId, requesterId);
-      if (Number(userId) === Number(requesterId) || reps.includes(Number(userId))) {
-        allowed = true;
-      }
-    } else {
-      // sales rep
-      if (Number(userId) === Number(requesterId)) allowed = true;
-    }
-    if (!allowed) return res.status(403).json({ error: 'Forbidden' });
-
-    const [row, created] = await Targets.findOrCreate({
-      where: { teamId, userId, month, year },
-      defaults: { targetValue: Number(targetValue||0), targetUnits: Number(targetUnits||0) },
-    });
-    if (!created) {
-      row.targetValue = Number(targetValue||0);
-      row.targetUnits = Number(targetUnits||0);
-      await row.save();
-    }
-    res.json({
-      id: row.id, teamId, userId, month, year,
-      targetValue: row.targetValue, targetUnits: row.targetUnits, created
-    });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'Failed to save target.', details: e.message });
+  if (membership.role === 'OWNER' || membership.role === 'ADMIN') {
+    return res.status(403).json({ error: 'Owners/Admins cannot edit personal targets.' });
   }
-};
 
-exports.deleteTarget = async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    const requesterId = req.user.id;
+  const [row] = await Targets.upsert({
+    teamId, userId: me.id, month, year,
+    targetValue: Number(targetValue||0),
+    targetUnits: Number(targetUnits||0),
+  });
 
-    const row = await Targets.findByPk(id);
-    if (!row) return res.status(404).json({ error: 'Not found' });
-
-    const tm = await isTeamMember(row.teamId, requesterId);
-    if (!tm) return res.status(403).json({ error: 'Forbidden' });
-
-    const { isOwnerAdmin, isManager } = await getRoleFlags(row.teamId, requesterId);
-    let allowed = false;
-    if (isOwnerAdmin) {
-      allowed = true;
-    } else if (isManager) {
-      const reps = await repIdsUnderManager(row.teamId, requesterId);
-      if (Number(row.userId) === Number(requesterId) || reps.includes(Number(row.userId))) {
-        allowed = true;
-      }
-    } else {
-      if (Number(row.userId) === Number(requesterId)) allowed = true;
-    }
-    if (!allowed) return res.status(403).json({ error: 'Forbidden' });
-
-    await row.destroy();
-    res.json({ ok: true });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'Failed to delete target.', details: e.message });
-  }
+  res.json({ ok:true, item: row });
 };

@@ -6,7 +6,8 @@ const {
   Contacts,
   Opportunities,
   OpportunityStatuses,
-  LeadHistory
+  LeadHistory,
+  Targets,
 } = require('@suites/database-models');
 
 /* ---------- helpers ---------- */
@@ -27,6 +28,104 @@ const wonWhere = () => ({ '$OpportunityStatus.isWon$': true });
 async function isTeamMember(teamId, userId) {
   return !!(await TeamMembers.findOne({ where: { teamId, userId } }));
 }
+
+// ===== Target helpers (monthly -> prorated / daily) =====
+function daysInMonth(year, month1to12) {
+  return new Date(year, month1to12, 0).getDate();
+}
+function clampDateStr(a, lo, hi) {
+  return a < lo ? lo : (a > hi ? hi : a);
+}
+
+function countInclusiveDays(from, to) {
+  const [y1,m1,d1] = from.split('-').map(Number);
+  const [y2,m2,d2] = to.split('-').map(Number);
+  const t1 = Date.UTC(y1, m1-1, d1);
+  const t2 = Date.UTC(y2, m2-1, d2);
+  if (t2 < t1) return 0;
+  return Math.floor((t2 - t1) / 86400000) + 1;
+}
+
+function enumerateMonthsInRange(from, to) {
+  const [fy, fm] = from.split('-').map(Number);
+  const [ty, tm] = to.split('-').map(Number);
+  const out = [];
+  let y = fy, m = fm;
+  while (y < ty || (y === ty && m <= tm)) {
+    out.push({ year: y, month: m });
+    m += 1; if (m > 12) { m = 1; y += 1; }
+  }
+  return out;
+}
+
+function daysBetween(from, to) {
+  const [y1,m1,d1] = from.split('-').map(Number);
+  const [y2,m2,d2] = to.split('-').map(Number);
+  let cur = Date.UTC(y1, m1-1, d1);
+  const end = Date.UTC(y2, m2-1, d2);
+  const out = [];
+  while (cur <= end) {
+    const t = new Date(cur);
+    const y = t.getUTCFullYear();
+    const m = String(t.getUTCMonth()+1).padStart(2,'0');
+    const d = String(t.getUTCDate()).padStart(2,'0');
+    out.push(`${y}-${m}-${d}`);
+    cur += 86400000;
+  }
+  return out;
+}
+
+async function fetchTargetsForRangeMulti(teamId, userIds, from, to) {
+  if (!userIds?.length) return [];
+  const months = enumerateMonthsInRange(from, to);
+  if (months.length === 0) return [];
+  const whereOr = months.map(({year, month}) => ({ year, month }));
+  return Targets.findAll({
+    where: {
+      teamId,
+      userId: { [Op.in]: userIds },
+      [Op.or]: whereOr,
+    },
+    attributes: ['userId','year','month','targetValue','targetUnits'],
+    raw: true,
+  });
+}
+
+function computeTargetCentsForRangeMulti(from, to, rows) {
+  let total = 0;
+  for (const r of rows) {
+    const { year, month, targetValue = 0 } = r;
+    const dim = daysInMonth(year, month);
+    const ms  = String(month).padStart(2,'0');
+    const monthStart = `${year}-${ms}-01`;
+    const monthEnd   = `${year}-${ms}-${String(dim).padStart(2,'0')}`;
+    const start = clampDateStr(monthStart, from, to);
+    const end   = clampDateStr(monthEnd,   from, to);
+    if (start > end) continue;
+    const overlapDays = countInclusiveDays(start, end);
+    total += Math.round(Number(targetValue) * (overlapDays / dim));
+  }
+  return total;
+}
+
+function buildDailyTargetMapMulti(from, to, rows) {
+  // Kumpul jumlah "daily cents" per bulan merentas semua user
+  const monthDaily = new Map(); // 'yyyy-mm' -> float cents/day (sum)
+  for (const r of rows) {
+    const { year, month, targetValue = 0 } = r;
+    const dim = daysInMonth(year, month);
+    const ym  = `${year}-${String(month).padStart(2,'0')}`;
+    const daily = dim ? Number(targetValue) / dim : 0;
+    monthDaily.set(ym, (monthDaily.get(ym) || 0) + daily);
+  }
+  const out = new Map(); // date -> integer cents
+  for (const d of daysBetween(from, to)) {
+    const ym = d.slice(0,7);
+    out.set(d, Math.round(monthDaily.get(ym) || 0));
+  }
+  return out;
+}
+
 
 /* =========================================================================
    LIST: managers with their reps (for selectors)
@@ -164,6 +263,9 @@ exports.adminSummary = async (req, res) => {
 
     const { startUTC, endUTC } = toUTCWindow(from, to);
 
+    const targetRows  = await fetchTargetsForRangeMulti(teamId, scopedUserIds, from, to);
+    const targetCents = computeTargetCentsForRangeMulti(from, to, targetRows);
+
     // KPI: contacts & opps created
     const [newContacts, oppCreated] = await Promise.all([
       Contacts.count({
@@ -191,9 +293,6 @@ exports.adminSummary = async (req, res) => {
 
     const wonDeals    = wonRows.length;
     const actualCents = wonRows.reduce((s, r) => s + Number(r.value || 0), 0);
-
-    // Target — left as 0 (sum your per-user targets here if you have them)
-    const targetCents = 0;
 
     res.json({
       range: { from, to, tzOffset },
@@ -287,6 +386,9 @@ exports.adminSummary = async (req, res) => {
         const d = String(shifted.getUTCDate()).padStart(2, '0');
         return `${y}-${m}-${d}`;
       };
+
+      const targetRows       = await fetchTargetsForRangeMulti(teamId, scopedUserIds, from, to);
+      const dailyTargetMap   = buildDailyTargetMapMulti(from, to, targetRows);
   
       // ---- pull rows in window and bucket by local day ----
   
@@ -336,7 +438,7 @@ exports.adminSummary = async (req, res) => {
   
       const sheet = days.map(d => ({
         date: d,
-        targetCents: 0,                     // plug daily targets here if you have them
+        targetCents: dailyTargetMap.get(d) || 0,                    // plug daily targets here if you have them
         actualCents: wonMap.get(d) || 0,
         newContacts: cMap.get(d) || 0,
         oppCreated:  oMap.get(d) || 0,
@@ -477,6 +579,4 @@ exports.adminConversions = async (req, res) => {
     console.error(e);
     res.status(500).json({ error: 'Failed to compute admin conversions.', details: e.message });
   }
-};
-
-  
+}; 
