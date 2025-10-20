@@ -201,36 +201,45 @@ router.post('/verify-session', validateToken, async (req, res) => {
   try {
     const { sessionId } = req.body;
     const userId = req.user.id;
+    if (!sessionId) return res.status(400).json({ error: 'SESSION_ID_REQUIRED' });
 
-    if (!sessionId) {
-      return res.status(400).json({ error: 'SESSION_ID_REQUIRED' });
+    // expand subscription so we can read its status
+    const session = await stripe.checkout.sessions.retrieve(sessionId, {
+      expand: ['subscription']
+    });
+
+    if (session.status !== 'complete') {
+      return res.status(402).json({ error: 'CHECKOUT_NOT_COMPLETE' });
     }
 
-    // Dapatkan maklumat sesi dari Stripe
-    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    const subStatus = session.subscription?.status; // 'trialing' | 'active' | etc.
+    const paidOk =
+      session.payment_status === 'paid' ||
+      (session.payment_status === 'no_payment_required' && (subStatus === 'trialing' || subStatus === 'active'));
 
-    // Semak jika sesi dah dibayar dan selesai
-    if (session.payment_status !== 'paid' || session.status !== 'complete') {
+    if (!paidOk) {
       return res.status(402).json({ error: 'PAYMENT_NOT_COMPLETED' });
     }
-    
-    // Keselamatan tambahan: pastikan sesi ini milik pengguna yang betul
+
+    // Safety: ensure session belongs to this user
     const billingInfo = await BillingCustomer.findOne({ where: { userId } });
-    if (session.customer !== billingInfo.stripeCustomerId) {
-        return res.status(403).json({ error: 'CUSTOMER_MISMATCH' });
+    if (!billingInfo || session.customer !== billingInfo.stripeCustomerId) {
+      return res.status(403).json({ error: 'CUSTOMER_MISMATCH' });
     }
-    
-    // PENTING: Proses fulfillment sebenar (tambah langganan dalam DB)
-    // sepatutnya diuruskan oleh webhook. Endpoint ini hanyalah untuk
-    // pengesahan segera di UI.
 
-    res.json({ success: true, message: 'Session verified.' });
-
+    // TIP: fulfillment is done by webhook; here we just tell UI it's ok
+    return res.json({
+      success: true,
+      message: 'Session verified.',
+      subscriptionStatus: subStatus || null,
+      paymentStatus: session.payment_status,
+    });
   } catch (error) {
     console.error('Error verifying session:', error);
-    res.status(500).json({ error: 'Failed to verify session' });
+    return res.status(500).json({ error: 'Failed to verify session' });
   }
 });
+
 
 /**
  * @route   POST /api/billing/create-portal-session
