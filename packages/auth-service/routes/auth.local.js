@@ -31,7 +31,7 @@ router.post('/login', async (req, res) => {
   if (!ok) return res.status(401).json({ error: 'INVALID_CREDENTIALS' });
 
   const token = jwt.sign({ id: user.id, uuid: user.uuid, email: user.email }, process.env.JWT_SECRET, { expiresIn: '7d' });
-  res.json({ token, user: { id: user.id, email: user.email, name: user.name } });
+  res.json({ token, user: { id: user.id, email: user.email, name: user.name, isValidated: user.isValidated} });
 });
 
 router.get('/me', validateToken, (req, res) => res.json(req.user));
